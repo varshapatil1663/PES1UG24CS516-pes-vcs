@@ -81,8 +81,7 @@ int object_exists(const ObjectID *id) {
 //   9. Store the computed hash in *id_out
 
 // HINTS - Useful syscalls and functions for this phase:
-//   - sprintf / snprintf : formatting the header string
-//   - compute_hash       : hashing the combined header + data
+//   - sprintf / snprintf : formatting the header string//   - compute_hash       : hashing the combined header + data
 //   - object_exists      : checking for deduplication
 //   - mkdir              : creating the shard directory (use mode 0755)
 //   - open, write, close : creating and writing to the temp file
@@ -94,11 +93,105 @@ int object_exists(const ObjectID *id) {
 //
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // TODO: Implement
-    (void)type; (void)data; (void)len; (void)id_out;
-    return -1;
-}
+    const char *type_str = NULL;
 
+    /* If these enum names are different in pes.h, replace only these 3 names */
+    switch (type) {
+        case OBJ_BLOB:   type_str = "blob";   break;
+        case OBJ_TREE:   type_str = "tree";   break;
+        case OBJ_COMMIT: type_str = "commit"; break;
+        default:
+            return -1;
+    }
+
+    char header[64];
+    int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len);
+    if (header_len < 0 || (size_t)header_len >= sizeof(header)) {
+        return -1;
+    }
+
+    size_t full_len = (size_t)header_len + 1 + len;
+    unsigned char *full_obj = malloc(full_len);
+    if (!full_obj) {
+        return -1;
+    }
+
+    memcpy(full_obj, header, header_len);
+    full_obj[header_len] = '\0';
+    if (len > 0 && data != NULL) {
+        memcpy(full_obj + header_len + 1, data, len);
+    }
+
+    compute_hash(full_obj, full_len, id_out);
+
+    if (object_exists(id_out)) {
+        free(full_obj);
+        return 0;
+    }
+
+    char final_path[512];
+    char hex[HASH_HEX_SIZE + 1];
+    char shard_dir[512];
+    char temp_path[512];
+
+    hash_to_hex(id_out, hex);
+    snprintf(shard_dir, sizeof(shard_dir), "%s/%.2s", OBJECTS_DIR, hex);
+    object_path(id_out, final_path, sizeof(final_path));
+    snprintf(temp_path, sizeof(temp_path), "%s/.tmp_%d", shard_dir, getpid());
+
+    if (mkdir(shard_dir, 0755) < 0) {
+        if (access(shard_dir, F_OK) != 0) {
+            free(full_obj);
+            return -1;
+        }
+    }
+
+    int fd = open(temp_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        free(full_obj);
+        return -1;
+    }
+
+    size_t written = 0;
+    while (written < full_len) {
+        ssize_t n = write(fd, full_obj + written, full_len - written);
+        if (n < 0) {
+            close(fd);
+            unlink(temp_path);
+            free(full_obj);
+            return -1;
+        }
+        written += (size_t)n;
+    }
+
+    if (fsync(fd) < 0) {
+        close(fd);
+        unlink(temp_path);
+        free(full_obj);
+        return -1;
+    }
+
+    if (close(fd) < 0) {
+        unlink(temp_path);
+        free(full_obj);
+        return -1;
+    }
+
+    if (rename(temp_path, final_path) < 0) {
+        unlink(temp_path);
+        free(full_obj);
+        return -1;
+    }
+
+    int dir_fd = open(shard_dir, O_RDONLY);
+    if (dir_fd >= 0) {
+        fsync(dir_fd);
+        close(dir_fd);
+    }
+
+    free(full_obj);
+    return 0;
+}
 // Read an object from the store.
 //
 // Steps:
@@ -122,7 +215,116 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 // The caller is responsible for calling free(*data_out).
 // Returns 0 on success, -1 on error (file not found, corrupt, etc.).
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // TODO: Implement
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
-    return -1;
+    char path[512];
+    object_path(id, path, sizeof(path));
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        return -1;
+    }
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    long file_size_long = ftell(fp);
+    if (file_size_long < 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    size_t file_size = (size_t)file_size_long;
+
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    unsigned char *buf = malloc(file_size);
+    if (!buf) {
+        fclose(fp);
+        return -1;
+    }
+
+    if (file_size > 0) {
+        size_t nread = fread(buf, 1, file_size, fp);
+        if (nread != file_size) {
+            free(buf);
+            fclose(fp);
+            return -1;
+        }
+    }
+
+    fclose(fp);
+
+    ObjectID computed;
+    compute_hash(buf, file_size, &computed);
+    if (memcmp(computed.hash, id->hash, HASH_SIZE) != 0) {
+        free(buf);
+        return -1;
+    }
+
+    unsigned char *nul = memchr(buf, '\0', file_size);
+    if (!nul) {
+        free(buf);
+        return -1;
+    }
+
+    size_t header_len = (size_t)(nul - buf);
+    char *header = malloc(header_len + 1);
+    if (!header) {
+        free(buf);
+        return -1;
+    }
+
+    memcpy(header, buf, header_len);
+    header[header_len] = '\0';
+
+    char type_str[16];
+    size_t obj_len = 0;
+
+    if (sscanf(header, "%15s %zu", type_str, &obj_len) != 2) {
+        free(header);
+        free(buf);
+        return -1;
+    }
+
+    /* If these enum names are different in pes.h, replace only these 3 names */
+    if (strcmp(type_str, "blob") == 0) {
+        *type_out = OBJ_BLOB;
+    } else if (strcmp(type_str, "tree") == 0) {
+        *type_out = OBJ_TREE;
+    } else if (strcmp(type_str, "commit") == 0) {
+        *type_out = OBJ_COMMIT;
+    } else {
+        free(header);
+        free(buf);
+        return -1;
+    }
+
+    size_t actual_len = file_size - (header_len + 1);
+    if (actual_len != obj_len) {
+        free(header);
+        free(buf);
+        return -1;
+    }
+
+    void *data_buf = malloc(obj_len);
+    if (obj_len > 0 && !data_buf) {
+        free(header);
+        free(buf);
+        return -1;
+    }
+
+    if (obj_len > 0) {
+        memcpy(data_buf, nul + 1, obj_len);
+    }
+
+    *data_out = data_buf;
+    *len_out = obj_len;
+
+    free(header);
+    free(buf);
+    return 0;
 }
