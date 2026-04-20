@@ -134,11 +134,50 @@ int index_status(const Index *index) {
 //   - hex_to_hash                      : converting the parsed string to ObjectID
 //
 // Returns 0 on success, -1 on error.
+static int compare_index_entries(const void *a, const void *b) {
+    const IndexEntry *ea = (const IndexEntry *)a;
+    const IndexEntry *eb = (const IndexEntry *)b;
+    return strcmp(ea->path, eb->path);
+}
 int index_load(Index *index) {
-    // TODO: Implement index loading
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+    index->count = 0;
+
+    FILE *fp = fopen(INDEX_FILE, "r");
+    if (!fp) {
+        /* If index file doesn't exist, start with empty index */
+        return 0;
+    }
+
+    while (index->count < MAX_INDEX_ENTRIES) {
+        IndexEntry entry;
+        char hex[HASH_HEX_SIZE + 1];
+
+        int rc = fscanf(fp, "%o %64s %ld %zu %255s",
+                        &entry.mode,
+                        hex,
+                        &entry.mtime_sec,
+                        &entry.size,
+                        entry.path);
+
+        if (rc == EOF) {
+            break;
+        }
+
+        if (rc != 5) {
+            fclose(fp);
+            return -1;
+        }
+
+        if (hex_to_hash(hex, &entry.object_id) != 0) {
+            fclose(fp);
+            return -1;
+        }
+
+        index->entries[index->count++] = entry;
+    }
+
+    fclose(fp);
+    return 0;
 }
 
 // Save the index to .pes/index atomically.
@@ -152,10 +191,48 @@ int index_load(Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_save(const Index *index) {
-    // TODO: Implement atomic index saving
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+    Index sorted = *index;
+
+    qsort(sorted.entries, sorted.count, sizeof(IndexEntry), compare_index_entries);
+
+    char temp_path[512];
+    snprintf(temp_path, sizeof(temp_path), "%s.tmp", INDEX_FILE);
+
+    FILE *fp = fopen(temp_path, "w");
+    if (!fp) {
+        return -1;
+    }
+
+    for (int i = 0; i < sorted.count; i++) {
+        char hex[HASH_HEX_SIZE + 1];
+        hash_to_hex(&sorted.entries[i].object_id, hex);
+
+        fprintf(fp, "%o %s %ld %zu %s\n",
+                sorted.entries[i].mode,
+                hex,
+                sorted.entries[i].mtime_sec,
+                sorted.entries[i].size,
+                sorted.entries[i].path);
+    }
+
+    fflush(fp);
+    if (fsync(fileno(fp)) != 0) {
+        fclose(fp);
+        unlink(temp_path);
+        return -1;
+    }
+
+    if (fclose(fp) != 0) {
+        unlink(temp_path);
+        return -1;
+    }
+
+    if (rename(temp_path, INDEX_FILE) != 0) {
+        unlink(temp_path);
+        return -1;
+    }
+
+    return 0;
 }
 
 // Stage a file for the next commit.
@@ -168,8 +245,72 @@ int index_save(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_add(Index *index, const char *path) {
-    // TODO: Implement file staging
-    // (See Lab Appendix for logical steps)
-    (void)index; (void)path;
-    return -1;
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return -1;
+    }
+
+    if (!S_ISREG(st.st_mode)) {
+        return -1;
+    }
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        return -1;
+    }
+
+    void *data = NULL;
+    if (st.st_size > 0) {
+        data = malloc((size_t)st.st_size);
+        if (!data) {
+            fclose(fp);
+            return -1;
+        }
+
+        size_t nread = fread(data, 1, (size_t)st.st_size, fp);
+        if (nread != (size_t)st.st_size) {
+            free(data);
+            fclose(fp);
+            return -1;
+        }
+    }
+
+    fclose(fp);
+
+    ObjectID oid;
+    if (object_write(OBJ_BLOB, data, (size_t)st.st_size, &oid) != 0) {
+        free(data);
+        return -1;
+    }
+
+    free(data);
+
+    IndexEntry *existing = index_find(index, path);
+    if (existing) {
+        existing->mode = (unsigned int)(st.st_mode & 0777);
+        if (existing->mode == 0755)
+            existing->mode = 100755;
+        else
+            existing->mode = 100644;
+
+        existing->object_id = oid;
+        existing->mtime_sec = st.st_mtime;
+        existing->size = (size_t)st.st_size;
+    } else {
+        if (index->count >= MAX_INDEX_ENTRIES) {
+            return -1;
+        }
+
+        IndexEntry *entry = &index->entries[index->count++];
+
+        entry->mode = ((st.st_mode & 0111) ? 100755 : 100644);
+        entry->object_id = oid;
+        entry->mtime_sec = st.st_mtime;
+        entry->size = (size_t)st.st_size;
+
+        strncpy(entry->path, path, sizeof(entry->path) - 1);
+        entry->path[sizeof(entry->path) - 1] = '\0';
+    }
+
+    return index_save(index);
 }
